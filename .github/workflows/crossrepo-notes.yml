@@ -1,0 +1,122 @@
+name: Pull PR notes from Test2
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "ISO start date (optional, e.g. 2025-01-01)"
+        required: false
+      until:
+        description: "ISO end date (optional, defaults to now)"
+        required: false
+
+permissions:
+  contents: write  # needed to update releases in this repo
+
+jobs:
+  build-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate notes from Test2 PRs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}  # updates release here
+          script: |
+            const core = require('@actions/core');
+            const { context } = require('@actions/github');
+
+            // ===== CONFIG =====
+            const SOURCE_OWNER = context.repo.owner; // change if owner differs
+            const SOURCE_REPO  = 'Test2';            // PRs come from here
+            const MAX_ITEMS    = 200;
+            const SECTION_HEADING = '### Pull requests merged in Test2';
+            // ===================
+
+            const iso = (d) => new Date(d).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+            // Current (this) release in Test2-Releases
+            const currentRelease = context.payload.release
+              ? context.payload.release
+              : (await github.rest.repos.getLatestRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo
+                })).data;
+
+            // Time window
+            const untilInput = core.getInput('until');
+            const sinceInput = core.getInput('since');
+            const until = untilInput ? new Date(untilInput) : new Date();
+            let since;
+
+            if (sinceInput) {
+              since = new Date(sinceInput);
+            } else {
+              const releases = await github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              });
+              releases.sort((a,b) => new Date(b.published_at || b.created_at) - new Date(a.published_at || a.created_at));
+              const idx = releases.findIndex(r => r.id === currentRelease.id);
+              const prev = releases.find((r, i) => i > idx && r.draft === false);
+              if (prev) {
+                since = new Date(prev.published_at || prev.created_at);
+              } else {
+                since = new Date(); since.setDate(since.getDate() - 90); // first release fallback
+              }
+            }
+
+            // Search merged PRs in Test2 within window
+            const q = [
+              `repo:${SOURCE_OWNER}/${SOURCE_REPO}`,
+              'is:pr',
+              'is:merged',
+              `merged:${iso(since)}..${iso(until)}`
+            ].join(' ');
+
+            // Use PAT for cross-repo read if present; otherwise fallback to GITHUB_TOKEN
+            const { Octokit } = require('@octokit/rest');
+            const otherToken = process.env.OTHER_REPO_TOKEN || process.env.GITHUB_TOKEN;
+            const other = new Octokit({ auth: otherToken });
+
+            const results = await other.paginate(other.rest.search.issuesAndPullRequests, {
+              q,
+              sort: 'updated',
+              order: 'desc',
+              per_page: 100
+            });
+
+            const items = results.slice(0, MAX_ITEMS);
+
+            const lines = items.map(pr => {
+              const labels = (pr.labels || []).map(l => (typeof l === 'string' ? l : l.name)).filter(Boolean);
+              const labelStr = labels.length ? ` [${labels.join(', ')}]` : '';
+              const author = pr.user?.login ? ` by @${pr.user.login}` : '';
+              return `- ${pr.title}${labelStr} (#${pr.number})${author} – ${pr.html_url}`;
+            });
+
+            const newSection = items.length
+              ? `${SECTION_HEADING}\n\n_Time window:_ **${iso(since)} → ${iso(until)}**\n\n${lines.join('\n')}\n`
+              : `${SECTION_HEADING}\n\n_No merged PRs found in ${SOURCE_OWNER}/${SOURCE_REPO} for **${iso(since)} → ${iso(until)}**._\n`;
+
+            // Re-fetch and update release body
+            const release = await github.rest.repos.getRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: currentRelease.id
+            });
+
+            const currentBody = release.data.body || '';
+            const separator = currentBody.trim().length ? '\n\n---\n\n' : '';
+            const updatedBody = `${currentBody}${separator}${newSection}`;
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: currentRelease.id,
+              body: updatedBody
+            });
+        env:
+          OTHER_REPO_TOKEN: ${{ secrets.OTHER_REPO_TOKEN }}
